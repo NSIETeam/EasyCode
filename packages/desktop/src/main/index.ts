@@ -104,7 +104,7 @@ function createWindow(): void {
       e.preventDefault();
       mainWindow?.hide();
       if (tray && !tray.isDestroyed()) {
-        mainWindow?.webContents.send('tray:notification', 'Easy Code is running in the background. Click the tray icon to restore.');
+        // Tray icon click restores window; no IPC needed
       }
     }
   });
@@ -187,6 +187,7 @@ app.on('window-all-closed', (e: Event) => {
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   hub?.disposeAll();
   // Tear down the desktop-managed Feishu gateway so we never leave an orphan
   // gateway behind (which the next launch would otherwise detect + kill).
