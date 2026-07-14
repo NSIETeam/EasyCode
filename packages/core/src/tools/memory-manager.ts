@@ -107,7 +107,16 @@ FILES:
 
   toolLocations(): ToolLocation[] { return []; }
   getDescription(p: MemoryManagerToolParams): string { return 'memory: ' + p.action + (p.task_type ? ' ' + p.task_type : ''); }
-  async shouldConfirmExecute(_p: MemoryManagerToolParams, _s: AbortSignal): Promise<ToolCallConfirmationDetails | false> { return false; }
+  async shouldConfirmExecute(p: MemoryManagerToolParams, _s: AbortSignal): Promise<ToolCallConfirmationDetails | false> {
+    if (this.config.getApprovalMode() === ApprovalMode.YOLO) return false;
+    if (this.validateToolParams(p)) return false;
+    // Confirm for destructive/mutating actions
+    const mutating = ['learn', 'onboard', 'offboard', 'update', 'sync'];
+    if (mutating.includes(p.action)) {
+      return { type: 'exec', title: 'Confirm: ' + this.getDescription(p), command: 'memory_manager(' + p.action + ')', rootCommand: 'memory_manager', onConfirm: async () => {} };
+    }
+    return false;
+  }
 
   async execute(p: MemoryManagerToolParams, _s: AbortSignal): Promise<ToolResult> {
     const err = this.validateToolParams(p);
@@ -144,14 +153,14 @@ FILES:
     let empContent = fs.existsSync(empFile) ? fs.readFileSync(empFile, 'utf8') : `# Employee: ${empId}\n\n## Task History\n`;
     empContent += `- [${now}] ${p.task_type}: ${(p.context || '').substring(0, 200)} -> ${p.task_result || 'ok'}${duration ? ' (' + duration + 'min)' : ''}\n`;
     this.updateEfficiencyTrend(empFile, empContent, p.task_type!, duration, success);
-    fs.writeFileSync(empFile, empContent);
+    this.atomicWrite(empFile, empContent);
     const wfFile = path.join(WORKFLOWS_DIR, p.task_type! + '.markdown');
     if (!fs.existsSync(wfFile)) {
-      fs.writeFileSync(wfFile, `# Workflow: ${p.task_type}\n\n## First Execution\n- Date: ${now}\n- Employee: ${empId}\n- Context: ${(p.context || '').substring(0, 500)}\n- Result: ${p.task_result || 'success'}\n- Duration: ${duration || 'unknown'}min\n`);
+      this.atomicWrite(wfFile, `# Workflow: ${p.task_type}\n\n## First Execution\n- Date: ${now}\n- Employee: ${empId}\n- Context: ${(p.context || '').substring(0, 500)}\n- Result: ${p.task_result || 'success'}\n- Duration: ${duration || 'unknown'}min\n`);
     } else {
       const wfContent = fs.readFileSync(wfFile, 'utf8');
       const execCount = (wfContent.match(/## Execution/g) || []).length + 1;
-      fs.writeFileSync(wfFile, wfContent + `\n## Execution ${execCount} [${now}]\n- Employee: ${empId}\n- Context: ${(p.context || '').substring(0, 300)}\n- Result: ${p.task_result || 'success'}\n- Duration: ${duration || 'unknown'}min\n`);
+      this.atomicWrite(wfFile, wfContent + `\n## Execution ${execCount} [${now}]\n- Employee: ${empId}\n- Context: ${(p.context || '').substring(0, 300)}\n- Result: ${p.task_result || 'success'}\n- Duration: ${duration || 'unknown'}min\n`);
       if (execCount >= 3) this.discoverPatterns(wfFile);
     }
     return `Learned: task=${p.task_type}, duration=${duration || 'unknown'}min, success=${success}, employee=${empId}`;
@@ -190,7 +199,7 @@ FILES:
       const wfs = fs.readdirSync(WORKFLOWS_DIR).filter(f => f.endsWith('.markdown'));
       if (wfs.length > 0) profile += `### Available Workflow Templates\n${wfs.map(w => '- ' + w.replace('.markdown', '')).join('\n')}\n`;
     }
-    fs.writeFileSync(empFile, profile);
+    this.atomicWrite(empFile, profile);
     return `Onboarded: ${empId}\nRole: ${p.role_id || 'unassigned'}\nDept: ${p.department_id || 'unassigned'}\nInherited: department SOPs + role workflows`;
   }
 
@@ -205,11 +214,11 @@ FILES:
     const deptFile = path.join(MEMORY_DIR, 'department.markdown');
     let deptContent = fs.existsSync(deptFile) ? fs.readFileSync(deptFile, 'utf8') : `# Department Knowledge Base\n`;
     deptContent += `\n## Offboarded Experience [${empId}] [${now}]\n### Task Patterns\n${taskLines.slice(-20).join('\n')}\n### Efficiency Benchmarks\n${efficiencyLines.join('\n')}\n`;
-    fs.writeFileSync(deptFile, deptContent);
+    this.atomicWrite(deptFile, deptContent);
     const archiveDir = path.join(MEMORY_DIR, 'archive');
     if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
-    fs.writeFileSync(path.join(archiveDir, `${empId}_${now}.markdown`), empContent);
-    fs.writeFileSync(empFile, `# Employee: (vacant)\n- Previous: ${empId} (offboarded ${now})\n- Experience merged to department\n`);
+    this.atomicWrite(path.join(archiveDir, `${empId}_${now}.markdown`), empContent);
+    this.atomicWrite(empFile, `# Employee: (vacant)\n- Previous: ${empId} (offboarded ${now})\n- Experience merged to department\n`);
     return `Offboarded: ${empId}\n- ${taskLines.length} task records merged\n- Profile archived`;
   }
 
@@ -237,7 +246,7 @@ FILES:
     for (const [type, d] of Object.entries(byType)) {
       r += viewer === 'employee' ? `| ${type} | ${d.count} | ${(d.min/d.count).toFixed(1)}min |\n` : `| ${type} | ${d.count} | ${(d.count*2000).toLocaleString()} | ${(d.count*2000/1000*0.014).toFixed(2)} |\n`;
     }
-    if (viewer === 'manager') { const rf = path.join(REPORTS_DIR, `report_${period}_${new Date().toISOString().split('T')[0]}.md`); fs.writeFileSync(rf, r); r += `\nSaved: ${rf}`; }
+    if (viewer === 'manager') { const rf = path.join(REPORTS_DIR, `report_${period}_${new Date().toISOString().split('T')[0]}.md`); this.atomicWrite(rf, r); r += `\nSaved: ${rf}`; }
     return r;
   }
 
@@ -245,7 +254,7 @@ FILES:
     const map: Record<string, string> = { 'employee': path.join(MEMORY_DIR, 'employee.markdown'), 'department': path.join(MEMORY_DIR, 'department.markdown'), 'role': path.join(MEMORY_DIR, 'role.markdown'), 'workflow': path.join(WORKFLOWS_DIR, (p.task_type || 'general') + '.markdown') };
     const fp = map[p.target!]; if (!fp) return 'Invalid target';
     const existing = fs.existsSync(fp) ? fs.readFileSync(fp, 'utf8') : '';
-    fs.writeFileSync(fp, existing + '\n' + p.content + '\n');
+    this.atomicWrite(fp, existing + '\n' + p.content + '\n');
     return `Updated ${p.target}.markdown (+${p.content!.length} chars)`;
   }
 
@@ -255,7 +264,7 @@ FILES:
       if (fs.existsSync(fp)) {
         let c = fs.readFileSync(fp, 'utf8').replace(/1[3-9]\d{9}/g, '[PHONE]').replace(/[\w.-]+@[\w.-]+\.\w+/g, '[EMAIL]').replace(/Employee:\s*\w+/g, 'Employee: [REDACTED]');
         const tmp = path.join(os.tmpdir(), `easycode_sync_${name}_${Date.now()}.md`);
-        fs.writeFileSync(tmp, c); files.push(`${name}: ${tmp} (${c.length} chars)`);
+        this.atomicWrite(tmp, c); files.push(`${name}: ${tmp} (${c.length} chars)`);
       }
     }
     return files.length > 0 ? `Sync prepared:\n${files.join('\n')}` : 'No files to sync.';
@@ -268,7 +277,7 @@ FILES:
       if (!fs.existsSync(d)) continue;
       for (const f of fs.readdirSync(d)) { const fp = path.join(d, f); if (fs.statSync(fp).isFile() && f.endsWith('.markdown')) { parts.push(`---\n# ${f}\n`); parts.push(fs.readFileSync(fp, 'utf8')); parts.push(''); } }
     }
-    fs.writeFileSync(out, parts.join('\n'));
+    this.atomicWrite(out, parts.join('\n'));
     return `Exported to: ${out} (${fs.statSync(out).size} bytes)`;
   }
 
@@ -283,6 +292,11 @@ FILES:
   }
 
   private ensureDirs(): void { for (const d of [MEMORY_DIR, WORKFLOWS_DIR, REPORTS_DIR]) { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); } }
+  private atomicWrite(filePath: string, content: string): void {
+    const tmp = filePath + '.tmp';
+    this.atomicWrite(tmp, content);
+    fs.renameSync(tmp, filePath);
+  }
   private updateEfficiencyTrend(empFile: string, content: string, taskType: string, duration: number, _success: boolean): void {
     if (duration <= 0) return;
     let c = content; const header = '## Efficiency Trends';
@@ -290,7 +304,7 @@ FILES:
     const pat = new RegExp(`- ${taskType}: (.+)`, 'g'); const m = pat.exec(c);
     if (m) { const pts = m[1].split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n)); pts.push(duration); const recent = pts.slice(-10); const avg = recent.reduce((a,b)=>a+b,0)/recent.length; c = c.replace(pat, `- ${taskType}: ${recent.join(', ')} (avg: ${avg.toFixed(1)}min, ${recent.length>1&&recent[recent.length-1]<avg?'improving':'stable'})`); }
     else c += `- ${taskType}: ${duration} (first record)\n`;
-    fs.writeFileSync(empFile, c);
+    this.atomicWrite(empFile, c);
   }
   private discoverPatterns(wfFile: string): void {
     const content = fs.readFileSync(wfFile, 'utf8'); const execs = content.split('## Execution').filter(s => s.trim());
@@ -298,7 +312,7 @@ FILES:
     const durations: number[] = []; for (const e of execs) { const m = e.match(/Duration:\s*(\d+\.?\d*)\s*min/); if (m) durations.push(parseFloat(m[1])); }
     if (durations.length >= 3 && !content.includes('## Discovered Patterns')) {
       const avg = durations.reduce((a,b)=>a+b,0)/durations.length;
-      fs.writeFileSync(wfFile, content + `\n## Discovered Patterns\n- Executions: ${durations.length}\n- Average: ${avg.toFixed(1)}min\n- Fastest: ${Math.min(...durations)}min\n- Slowest: ${Math.max(...durations)}min\n`);
+      this.atomicWrite(wfFile, content + `\n## Discovered Patterns\n- Executions: ${durations.length}\n- Average: ${avg.toFixed(1)}min\n- Fastest: ${Math.min(...durations)}min\n- Slowest: ${Math.max(...durations)}min\n`);
     }
   }
 }
