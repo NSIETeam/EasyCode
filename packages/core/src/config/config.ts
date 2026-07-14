@@ -1172,8 +1172,10 @@ export class Config {
     // TaskTool (SubAgent) is available in both CLI and VSCode environments
     registerCoreTool(TaskTool, this, registry);
 
-    // VideoEditorTool - built-in OpenReel video editor
-    registerCoreTool(VideoEditorTool, this);
+    // VideoEditorTool - built-in OpenReel video editor (skip in noBrowser/vsCodePlugin mode)
+    if (!this.getNoBrowser() && !this.getVsCodePluginMode()) {
+      registerCoreTool(VideoEditorTool, this);
+    }
 
     // WebAutomationTool - browser automation via Playwright
     registerCoreTool(WebAutomationTool, this);

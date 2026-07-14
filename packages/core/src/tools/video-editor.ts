@@ -98,6 +98,7 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
     if (p.action === 'cut' && p.start_time! >= p.end_time!) return 'video_editor/cut: start_time must be < end_time';
     if (p.action === 'cut' && p.start_time! < 0) return 'video_editor/cut: start_time must be >= 0';
     if (p.action === 'ai_edit' && !p.ai_instruction) return 'video_editor/ai_edit: ai_instruction required';
+    if (p.color && !/^#[0-9A-Fa-f]{6}$/.test(p.color)) return 'video_editor: color must be hex format (e.g. #FFFFFF)';
     return null;
   }
 
@@ -141,14 +142,18 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
 
     if (editorPath.startsWith('file://')) {
       // Open bundled editor in default browser (works for all platforms)
-      if (isWin) {
-        exec(`start "" "${editorPath}"`);
-      } else if (os.platform() === 'darwin') {
-        exec(`open "${editorPath}"`);
-      } else {
-        exec(`xdg-open "${editorPath}"`);
+      try {
+        if (isWin) {
+          exec(`start "" "${editorPath}"`);
+        } else if (os.platform() === 'darwin') {
+          exec(`open "${editorPath}"`);
+        } else {
+          await execAsync(`xdg-open "${editorPath}"`, { timeout: 5000 });
+        }
+      } catch {
+        return `Editor available at ${editorPath} but could not open browser automatically. Open manually.`;
       }
-      return `launched bundled editor (${editorPath.substring(0, 50)}...)`;
+      return `launched bundled editor`;
     }
 
     // Fallback: try dev server
@@ -160,6 +165,7 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
       // Track PID for cleanup
       try { fs.writeFileSync(PID_FILE, String(child.pid)); } catch {}
       for (let i = 0; i < 30; i++) {
+        if (_s.aborted) throw new Error('aborted');
         await new Promise(r => setTimeout(r, 1000));
         if (await this.isDevServerRunning()) break;
       }
@@ -167,6 +173,10 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
 
     if (isWin) exec(`start "" "${DEV_URL}"`);
     else if (os.platform() === 'darwin') exec(`open "${DEV_URL}"`);
+    else {
+      try { await execAsync(`xdg-open "${DEV_URL}"`, { timeout: 5000 }); }
+      catch { return `Dev server running at ${DEV_URL} but could not open browser. Open manually.`; }
+    }
     return `launched dev server at ${DEV_URL}`;
   }
 
@@ -195,10 +205,17 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
         }
 
         case 'import': {
-          if (!fs.existsSync(p.file_path!)) return { llmContent: `File not found: ${p.file_path}`, returnDisplay: 'Import failed' };
+          const fp = p.file_path!;
+          if (!fp) return { llmContent: 'file_path required', returnDisplay: 'Import failed' };
+          if (!fs.existsSync(fp)) return { llmContent: `File not found: ${fp}`, returnDisplay: 'Import failed' };
           if (!await this.isEditorRunning() && !await this.isDevServerRunning()) await this.launchEditor();
-          await new Promise(r => setTimeout(r, 2000));
-          r = `Video "${path.basename(p.file_path!)}" ready for import. In the editor, use File > Import to load it.\nPath: ${p.file_path}`;
+          // Wait for editor to be ready (max 5s, abortable)
+          for (let i = 0; i < 5; i++) {
+            if (_s.aborted) throw new Error('aborted');
+            if (await this.isDevServerRunning() || await this.isEditorRunning()) break;
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          r = `Video "${path.basename(fp)}" ready for import. In the editor, use File > Import to load it.\nPath: ${fp}`;
           break;
         }
 
