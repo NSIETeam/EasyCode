@@ -2602,14 +2602,9 @@ function setupLoginHandlers() {
         error: error instanceof Error ? error.message : 'Unknown error'
       });
       // Fix: notify frontend to clear isModelSwitching state on failure
-      // Use try-catch to avoid masking the original error if webview is disposed
+      // Send empty model name so frontend clears loading state without updating selectedModelId
       if (payload.sessionId) {
         try {
-          await communicationService.sendModelResponse(payload.requestId, {
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-          // Only clear isModelSwitching, don't update selectedModelId
           await communicationService.sendModelSwitchComplete(payload.sessionId, '');
         } catch {}
       }
