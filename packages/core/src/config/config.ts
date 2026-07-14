@@ -1172,7 +1172,10 @@ export class Config {
     registerCoreTool(TaskTool, this, registry);
 
     // WebAutomationTool - browser automation via Playwright
-    registerCoreTool(WebAutomationTool, this);
+    // WebAutomationTool - browser automation via Playwright (skip in noBrowser mode)
+    if (!this.getNoBrowser()) {
+      registerCoreTool(WebAutomationTool, this);
+    }
 
     // WorkflowTool is disabled in VSCode plugin mode (not yet adapted)
     // but remains available in CLI mode
