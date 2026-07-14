@@ -1172,7 +1172,10 @@ export class Config {
     registerCoreTool(TaskTool, this, registry);
 
     // VideoAnalyzerTool - video analysis with FFmpeg + subtitles
-    registerCoreTool(VideoAnalyzerTool, this);
+    // VideoAnalyzerTool - requires ffmpeg, skip in noBrowser mode
+    if (!this.getNoBrowser()) {
+      registerCoreTool(VideoAnalyzerTool, this);
+    }
 
     // WorkflowTool is disabled in VSCode plugin mode (not yet adapted)
     // but remains available in CLI mode
