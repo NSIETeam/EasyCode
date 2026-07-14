@@ -41,6 +41,9 @@ import { UseSkillTool } from '../tools/use-skill.js';
 import { ListSkillsTool } from '../tools/list-skills.js';
 import { GetSkillDetailsTool } from '../tools/get-skill-details.js';
 import { WebAutomationTool } from '../tools/web-automation.js';
+import { VideoAnalyzerTool } from '../tools/video-analyzer.js';
+import { MemoryManagerTool } from '../tools/memory-manager.js';
+import { VideoEditorTool } from '../tools/video-editor.js';
 // Old LSP tools imports removed
 
 import { PptOutlineTool } from '../tools/ppt/pptOutlineTool.js';
@@ -1171,10 +1174,22 @@ export class Config {
     // TaskTool (SubAgent) is available in both CLI and VSCode environments
     registerCoreTool(TaskTool, this, registry);
 
-    // WebAutomationTool - browser automation via Playwright
     // WebAutomationTool - browser automation via Playwright (skip in noBrowser mode)
     if (!this.getNoBrowser()) {
       registerCoreTool(WebAutomationTool, this);
+    }
+
+    // VideoAnalyzerTool - video analysis with FFmpeg + subtitles (skip in noBrowser mode)
+    if (!this.getNoBrowser()) {
+      registerCoreTool(VideoAnalyzerTool, this);
+    }
+
+    // MemoryManagerTool - auto-learning knowledge base + HR lifecycle
+    registerCoreTool(MemoryManagerTool, this);
+
+    // VideoEditorTool - built-in OpenReel video editor (skip in noBrowser/vsCodePlugin mode)
+    if (!this.getNoBrowser() && !this.getVsCodePluginMode()) {
+      registerCoreTool(VideoEditorTool, this);
     }
 
     // WorkflowTool is disabled in VSCode plugin mode (not yet adapted)
