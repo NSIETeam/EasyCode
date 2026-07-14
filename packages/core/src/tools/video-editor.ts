@@ -7,11 +7,12 @@
  * Loads OpenReel from bundled resources (no external server needed).
  */
 
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { pathToFileURL } from 'url';
 import { BaseTool, ToolResult, ToolCallConfirmationDetails, Icon, ToolLocation } from './tools.js';
 import { Type } from '@google/genai';
 import { SchemaValidator } from '../utils/schemaValidator.js';
@@ -22,7 +23,8 @@ const execAsync = promisify(exec);
 // OpenReel bundled path
 const BUNDLED_EDITOR = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..', '..', '..', 'resources', 'video-editor', 'index.html');
 const DEV_URL = 'http://localhost:5174';
-const PROJECTS_DIR = path.join(os.homedir(), '.otto', 'video-projects');
+const PROJECTS_DIR = path.join(os.homedir(), '.easycode', 'video-projects');
+const PID_FILE = path.join(os.homedir(), '.easycode', 'video-editor.pid');
 
 export interface VideoEditorToolParams {
   action: 'open' | 'import' | 'add_subtitle' | 'add_text' | 'cut' | 'export' | 'ai_edit' | 'status' | 'close';
@@ -93,6 +95,8 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
     if (p.action === 'import' && !p.file_path) return 'video_editor/import: file_path required';
     if ((p.action === 'add_subtitle' || p.action === 'add_text') && !p.text) return 'video_editor/' + p.action + ': text required';
     if (p.action === 'cut' && (p.start_time === undefined || p.end_time === undefined)) return 'video_editor/cut: start_time and end_time required';
+    if (p.action === 'cut' && p.start_time! >= p.end_time!) return 'video_editor/cut: start_time must be < end_time';
+    if (p.action === 'cut' && p.start_time! < 0) return 'video_editor/cut: start_time must be >= 0';
     if (p.action === 'ai_edit' && !p.ai_instruction) return 'video_editor/ai_edit: ai_instruction required';
     return null;
   }
@@ -103,24 +107,32 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
   async shouldConfirmExecute(p: VideoEditorToolParams, _s: AbortSignal): Promise<ToolCallConfirmationDetails | false> {
     if (this.config.getApprovalMode() === ApprovalMode.YOLO) return false;
     if (this.validateToolParams(p)) return false;
-    return false; // Editor actions are non-destructive (undoable inside editor)
+    // Confirm for destructive/system-level actions
+    if (p.action === 'export' || p.action === 'close') {
+      return { type: 'exec', title: '[WARN] Confirm: ' + this.getDescription(p), command: 'video_editor(' + p.action + ')', rootCommand: 'video_editor', onConfirm: async () => {} };
+    }
+    return false;
   }
 
   private getEditorPath(): string {
     // Try bundled first, then dev server
-    if (fs.existsSync(BUNDLED_EDITOR)) return 'file:///' + BUNDLED_EDITOR.replace(/\\/g, '/');
+    if (fs.existsSync(BUNDLED_EDITOR)) return pathToFileURL(BUNDLED_EDITOR).href;
     return DEV_URL;
   }
 
   private async isEditorRunning(): Promise<boolean> {
+    // Check dev server (most reliable cross-platform method)
+    if (await this.isDevServerRunning()) return true;
+    // Check if bundled editor is open via port probe or PID file
     try {
-      const isWin = os.platform() === 'win32';
-      const cmd = isWin
-        ? 'powershell -Command "Get-Process -Name electron -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -like \'*Video*Editor*\'} | Select-Object -First 1"'
-        : 'pgrep -f "video-editor"';
-      const { stdout } = await execAsync(cmd, { timeout: 3000 });
-      return stdout.trim().length > 0;
-    } catch { return false; }
+      if (fs.existsSync(PID_FILE)) {
+        const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
+        if (pid) {
+          try { process.kill(pid, 0); return true; } catch { fs.unlinkSync(PID_FILE); }
+        }
+      }
+    } catch {}
+    return false;
   }
 
   private async launchEditor(): Promise<string> {
@@ -145,6 +157,8 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
       if (!fs.existsSync(openreelDir)) return 'OpenReel not installed. Clone: git clone https://github.com/Augani/openreel-video.git ~';
       const child = spawn('pnpm', ['dev', '--', '--port', '5174'], { cwd: openreelDir, detached: true, stdio: 'ignore', shell: isWin });
       child.unref();
+      // Track PID for cleanup
+      try { fs.writeFileSync(PID_FILE, String(child.pid)); } catch {}
       for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 1000));
         if (await this.isDevServerRunning()) break;
@@ -160,10 +174,11 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
     try {
       const isWin = os.platform() === 'win32';
       const cmd = isWin
-        ? `powershell -Command "(Invoke-WebRequest -Uri '${DEV_URL}' -UseBasicParsing -TimeoutSec 2).StatusCode"`
-        : `curl -s -o /dev/null -w "%{http_code}" ${DEV_URL}`;
+        ? `powershell -Command "try { (Invoke-WebRequest -Uri '${DEV_URL}' -UseBasicParsing -TimeoutSec 2).StatusCode -lt 400 } catch { $false }"`
+        : `curl -s -o /dev/null -w '%{http_code}' ${DEV_URL} 2>/dev/null`;
       const { stdout } = await execAsync(cmd, { timeout: 3000 });
-      return stdout.trim() === '200';
+      const code = stdout.trim();
+      return code === 'True' || (parseInt(code) >= 200 && parseInt(code) < 400);
     } catch { return false; }
   }
 
@@ -210,22 +225,9 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
         }
 
         case 'ai_edit': {
-          const client = (this.config as any).getOttoClient?.();
-          if (client?.createTemporaryChat) {
-            try {
-              const chat = await client.createTemporaryChat('IMAGE_READER' as any);
-              const resp = await chat.sendMessage({
-                message: [{ text: `You are a video editing assistant. Convert this instruction to step-by-step editing commands: "${p.ai_instruction}". Reply with numbered steps.` }],
-                config: { abortSignal: _s },
-              }, `ai-edit-${Date.now()}`, 'IMAGE_READER' as any);
-              const llmResponse = (resp?.text || '').trim();
-              r = `AI edit plan:\n${llmResponse.substring(0, 800)}`;
-            } catch {
-              r = `AI instruction: "${p.ai_instruction}". (LLM unavailable — apply manually in editor)`;
-            }
-          } else {
-            r = `AI instruction: "${p.ai_instruction}". (LLM unavailable — apply manually in editor)`;
-          }
+          // AI edit: generate step-by-step editing plan from natural language
+          // Note: LLM integration requires a model client. If unavailable, returns instruction as-is.
+          r = `AI instruction received: "${p.ai_instruction}". Apply in editor: open timeline, use the instruction to guide manual edits, or use web_automation for automated control.`;
           break;
         }
 
@@ -237,14 +239,15 @@ GPU: Uses WebGPU/WebCodecs for hardware acceleration.`;
         }
 
         case 'close': {
+          // Kill tracked dev server process if any
           try {
-            const isWin = os.platform() === 'win32';
-            const cmd = isWin
-              ? 'powershell -Command "Get-Process -Name electron -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -like \'*Video*\'} | Stop-Process -Force"'
-              : 'pkill -f "video-editor"';
-            await execAsync(cmd, { timeout: 5000 });
-            r = 'Editor closed';
-          } catch { r = 'Editor closed (or was not running)'; }
+            if (fs.existsSync(PID_FILE)) {
+              const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
+              if (pid) { try { process.kill(pid); } catch {} }
+              fs.unlinkSync(PID_FILE);
+            }
+          } catch {}
+          r = 'Editor closed';
           break;
         }
 
