@@ -40,6 +40,7 @@ import { WorkflowTool } from '../tools/workflow.js';
 import { UseSkillTool } from '../tools/use-skill.js';
 import { ListSkillsTool } from '../tools/list-skills.js';
 import { GetSkillDetailsTool } from '../tools/get-skill-details.js';
+import { VideoEditorTool } from '../tools/video-editor.js';
 import { WebAutomationTool } from '../tools/web-automation.js';
 import { VideoAnalyzerTool } from '../tools/video-analyzer.js';
 import { MemoryManagerTool } from '../tools/memory-manager.js';
@@ -1174,7 +1175,6 @@ export class Config {
     // TaskTool (SubAgent) is available in both CLI and VSCode environments
     registerCoreTool(TaskTool, this, registry);
 
-<<<<<<< HEAD
     // WebAutomationTool - browser automation via Playwright (skip in noBrowser mode)
     if (!this.getNoBrowser()) {
       registerCoreTool(WebAutomationTool, this);
