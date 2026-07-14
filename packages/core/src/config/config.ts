@@ -1174,6 +1174,7 @@ export class Config {
     // TaskTool (SubAgent) is available in both CLI and VSCode environments
     registerCoreTool(TaskTool, this, registry);
 
+<<<<<<< HEAD
     // WebAutomationTool - browser automation via Playwright (skip in noBrowser mode)
     if (!this.getNoBrowser()) {
       registerCoreTool(WebAutomationTool, this);
