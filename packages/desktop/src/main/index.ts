@@ -188,6 +188,7 @@ app.on('window-all-closed', (e: Event) => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  tray?.destroy();
   hub?.disposeAll();
   // Tear down the desktop-managed Feishu gateway so we never leave an orphan
   // gateway behind (which the next launch would otherwise detect + kill).
