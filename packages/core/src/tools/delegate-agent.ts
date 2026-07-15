@@ -1,7 +1,6 @@
 /**
  * @license
- * Copyright 2026 Easy Code team
- * https://github.com/OrionStarAI/EasyCode
+ * Copyright 2026 Felix
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -9,8 +8,7 @@ import { Type } from '@google/genai';
 import { BaseTool, Icon, type ToolResult } from './tools.js';
 import { type Config } from '../config/config.js';
 import { SchemaValidator } from '../utils/schemaValidator.js';
-import { runDelegatedTask, type DelegateProgress } from '../acp-client/acpAgentClient.js';
-import { isAgentAvailable } from '../acp-client/localAgentDetection.js';
+import { runDelegatedTask } from '../acp-client/acpAgentClient.js';
 import {
   EXTERNAL_AGENT_TYPES,
   isExternalAgentType,
@@ -68,14 +66,6 @@ export interface DelegateToAgentParams {
    * full history before running `task`, so follow-ups keep prior context.
    */
   resumeSessionId?: string;
-  /**
-   * Model the external agent should run, matched against that agent's own
-   * advertised models — by model id, or a case-insensitive substring of the
-   * model name (e.g. "deepseek-v4-pro"). Omit to use the agent's default model.
-   * Agents that don't support runtime model switching ignore this and keep
-   * their default; an unmatched value is also a no-op (default model is kept).
-   */
-  model?: string;
 }
 
 /** Result shape for {@link DelegateToAgentTool}. */
@@ -84,7 +74,7 @@ export interface DelegateToAgentResult extends ToolResult {
 }
 
 /**
- * Delegates a coding task to the user's local Claude Code, with Easy Code acting
+ * Delegates a coding task to the user's local Claude Code, with Otto acting
  * as the ACP orchestrator. Claude Code runs asynchronously in the bound project —
  * the main agent is free to continue other work while the delegated task runs.
  * Completion is reported through the BackgroundTaskManager event system.
@@ -123,7 +113,6 @@ export class DelegateToAgentTool extends BaseTool<
         '- The agent runs locally in the bound project directory and CAN modify files (permissions are auto-approved).',
         '- It uses the machine\'s own pre-existing login (e.g. `claude login` / `codex login`); no extra credentials are passed.',
         '- Provide a complete, self-contained instruction in `task` — the delegated agent does not see this conversation.',
-        '- Optional `model`: pick which model the external agent runs (by its model id or name, e.g. "deepseek-v4-pro"); omitted or unsupported → the agent keeps its default model.',
       ].join('\n'),
       Icon.Hammer,
       {
@@ -155,11 +144,6 @@ export class DelegateToAgentTool extends BaseTool<
             type: Type.STRING,
             description:
               'Optional. Resume an existing native session of the external agent (a sessionId from the /acp-session list) instead of starting fresh. The agent reloads that conversation before running the task.',
-          },
-          model: {
-            type: Type.STRING,
-            description:
-              'Optional. Which model the external agent should run, matched against that agent\'s own available models — by model id, or a case-insensitive substring of the model name (e.g. "deepseek-v4-pro"). Omit to use the agent\'s default. Agents that don\'t support runtime model switching ignore this and keep their default.',
           },
         },
         required: ['task'],
@@ -196,9 +180,6 @@ export class DelegateToAgentTool extends BaseTool<
     if (params.mode !== undefined && !DELEGATE_MODES.includes(params.mode)) {
       return `Parameter "mode" must be one of: ${DELEGATE_MODES.join(', ')}.`;
     }
-    if (params.model !== undefined && typeof params.model !== 'string') {
-      return 'Parameter "model" must be a string.';
-    }
     return null;
   }
 
@@ -231,28 +212,27 @@ export class DelegateToAgentTool extends BaseTool<
     const mode: DelegateMode = params.mode ?? DEFAULT_MODE;
     const label = resolveExternalAgentSpec(agent).label;
 
-    // Runtime guard: even if the tool was registered (an agent was available
-    // at startup), the user may have uninstalled it mid-session. Check again
-    // before dispatching, so the AI gets a clear message instead of silently
-    // spawning a process that will fail with ENOENT.
-    const agentReady = await isAgentAvailable(agent);
-    if (!agentReady) {
-      const guidance =
-        `${label} is not installed on this machine. The task was NOT dispatched — nothing was executed.\n` +
-        `To use this feature, install ${label} (e.g. \`npm install -g ${agent === 'codex' ? '@openai/codex' : '@anthropic-ai/claude-code'}\`) and log in, ` +
-        `or set the ${agent === 'codex' ? 'EASYCODE_CODEX_ACP_CMD' : 'EASYCODE_CLAUDE_CODE_ACP_CMD'} environment variable to point to a custom ACP bridge.\n` +
-        `You should inform the user that ${label} is not available and handle the task yourself.`;
-      return {
-        status: 'failed',
-        llmContent: JSON.stringify({
+    // 多 agent 并行冲突检测：resumeSessionId 场景是"回到同一个已有会话继续"，
+    // 本质是同一个逻辑任务的延续而非新开一个并行任务，不做互斥检查（否则
+    // 用户想 resume 自己刚才那个任务时反被自己拦住）。只在真正"新开一个
+    // delegate 任务"时检查目标目录是否已有另一个 ACP agent 在跑。
+    if (!params.resumeSessionId) {
+      const conflict = getBackgroundTaskManager().findConflictingTask(cwd);
+      if (conflict) {
+        const conflictLabel = conflict.kind === 'codex' ? 'Codex' : 'Claude Code';
+        const runningSec = Math.round((Date.now() - conflict.startTime) / 1000);
+        const msg =
+          `Cannot start ${label}: ${conflictLabel} is already running in an overlapping ` +
+          `directory (Task ID: ${conflict.id}, dir: ${conflict.directory}, running for ${runningSec}s). ` +
+          `Running two agents on the same working tree concurrently risks file/git conflicts. ` +
+          `Wait for it to finish, use delegate_status to check progress, or pick a different directory.`;
+        return {
           status: 'failed',
-          agent,
-          error: `${label} is not installed on this machine`,
-          guidance,
-        }),
-        returnDisplay: `❌ ${label} 未安装，任务未执行。请先安装 ${label} 或由 Easy Code 自行处理。`,
-        summary: `${label} not installed`,
-      };
+          llmContent: JSON.stringify({ status: 'failed', error: msg, conflictingTaskId: conflict.id }),
+          returnDisplay: `⚠️ ${msg}`,
+          summary: `Blocked: ${conflictLabel} already running in this directory`,
+        };
+      }
     }
 
     if (mode === 'stream') {
@@ -306,43 +286,16 @@ export class DelegateToAgentTool extends BaseTool<
     updateOutput?: (output: string) => void,
   ): Promise<DelegateToAgentResult> {
     const startTime = Date.now();
-
-    // Stream the transcript AND structured progress together as a single
-    // tagged JSON payload (mirrors the task tool's `subagent_update` contract).
-    // The Feishu card recognizes `delegate_update` and renders a structured box
-    // + a footer reflecting the EXTERNAL agent's real model/token, instead of a
-    // flat transcript blob with Easy Code's own metrics. We push faithfully on
-    // every update; throttling is the cli card's responsibility.
-    let latestTranscript = '';
-    let latestProgress: DelegateProgress | undefined;
-    const pushDelegateUpdate = () => {
-      if (!updateOutput) return;
-      updateOutput(
-        JSON.stringify({
-          type: 'delegate_update',
-          data: { agent, label, transcript: latestTranscript, progress: latestProgress },
-        }),
-      );
-    };
-
     try {
       const result = await runDelegatedTask({
         agentType: agent,
         task: params.task,
         cwd,
         signal,
-        onUpdate: (output) => {
-          latestTranscript = output;
-          pushDelegateUpdate();
-        },
-        onProgress: (progress) => {
-          latestProgress = progress;
-          pushDelegateUpdate();
-        },
+        onUpdate: updateOutput,
         autoApprove: true,
         timeoutMs: DelegateToAgentTool.DEFAULT_TIMEOUT_MS,
         resumeSessionId: params.resumeSessionId,
-        model: params.model,
       });
 
       const duration = Math.round((Date.now() - startTime) / 1000);
@@ -395,10 +348,12 @@ export class DelegateToAgentTool extends BaseTool<
    * Default timeout for delegated tasks. Claude Code coding tasks can
    * legitimately run for many minutes (large refactors, running test suites,
    * etc.), so we default to 60 minutes. Override with the environment
-   * variable EASYCODE_CC_TIMEOUT_MINUTES.
+   * variable OTTO_CC_TIMEOUT_MINUTES (legacy: OTTO_CC_TIMEOUT_MINUTES).
    */
   static readonly DEFAULT_TIMEOUT_MS = (() => {
-    const env = process.env.EASYCODE_CC_TIMEOUT_MINUTES;
+    const env =
+      process.env.OTTO_CC_TIMEOUT_MINUTES ??
+      process.env.OTTO_CC_TIMEOUT_MINUTES;
     if (env) {
       const mins = parseInt(env, 10);
       if (mins > 0) return mins * 60 * 1000;
@@ -439,7 +394,6 @@ export class DelegateToAgentTool extends BaseTool<
         autoApprove: true,
         timeoutMs: DelegateToAgentTool.DEFAULT_TIMEOUT_MS,
         resumeSessionId: params.resumeSessionId,
-        model: params.model,
       });
 
       // Write the final answer + native session id into the task record.

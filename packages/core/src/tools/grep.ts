@@ -45,8 +45,28 @@ function getRipgrepPath(): string {
     return findVSCodeRipgrep();
   } else {
     logger.info('[GrepTool] CLI environment detected - using bundled ripgrep');
-    return rgPath;
+    return resolvePackagedRgPath(rgPath);
   }
+}
+
+/**
+ * In a packaged Electron app the bundled rgPath points inside `app.asar`, where
+ * the executable cannot be spawned by child_process. The rg binary is shipped
+ * outside the archive to `<app>/Contents/Resources/ripgrep/rg` via electron-builder
+ * `extraResources`; resolve to that real file. No-op outside a packaged app
+ * (process.resourcesPath unset, or the default path is not inside an asar).
+ */
+function resolvePackagedRgPath(defaultPath: string): string {
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string })
+    .resourcesPath;
+  if (resourcesPath && defaultPath.includes('app.asar')) {
+    const binName = process.platform === 'win32' ? 'rg.exe' : 'rg';
+    const candidate = path.join(resourcesPath, 'ripgrep', binName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return defaultPath;
 }
 
 
@@ -654,12 +674,7 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
    */
   private parseStandardOutput(output: string, basePath: string, searchPath?: string): GrepMatch[] {
     const results: GrepMatch[] = [];
-    // Split on \r?\n so Windows CRLF output doesn't leave a trailing \r on each
-    // line. The match regexes below are `$`-anchored with `(.*)$`; in JS `.` does
-    // not match `\r` and `$` (no /m) does not match before a `\r`, so a stray
-    // trailing `\r` makes every line fail to parse → 0 matches even when ripgrep
-    // found plenty. This was the cause of "search returns empty" on Windows.
-    const lines = output.split(/\r?\n/).filter(line => line.trim());
+    const lines = output.split('\n').filter(line => line.trim());
 
     // Determine if this is a single file search (cache the stat call once)
     let isSearchingFile = false;

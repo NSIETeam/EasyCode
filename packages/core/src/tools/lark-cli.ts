@@ -1,7 +1,6 @@
 /**
  * @license
- * Copyright 2026 Easy Code team
- * https://github.com/OrionStarAI/DeepVCode
+ * Copyright 2026 Felix
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -16,6 +15,13 @@ import os from 'node:os';
  * Throttle interval for pushing live output to the UI.
  */
 const OUTPUT_UPDATE_INTERVAL_MS = 500;
+
+/**
+ * 安全:npx 兜底执行时锁定的 lark-cli 版本。避免使用 @latest——否则一旦注册表
+ * 被劫持或上游被投毒,npx 会静默拉取被篡改的新版本造成 RCE。需要升级时在此
+ * 显式更新版本号(并复核 changelog),不要回退到 @latest。
+ */
+const LARK_CLI_PINNED_VERSION = '1.0.53';
 
 /**
  * Fallback watchdog timeout. The device-flow authorization (`auth login` /
@@ -47,6 +53,42 @@ function isAuthCommand(command: string): boolean {
     c.startsWith('auth login') ||
     c.startsWith('auth logout')
   );
+}
+
+/**
+ * 安全:校验 JSON.parse 出来的值是否为「可信结构化数据」——即纯对象或数组。
+ * lark-cli 的输出可被供应链/MITM/prompt-injection 污染,顶层标量(字符串、
+ * 数字、布尔、null)会被直接当成 data 注入 llmContent 交给模型。这里只放行
+ * 结构化容器,其余一律退回纯文本兜底,杜绝把任意标量当成可信结果。
+ */
+function isPlainStructuredData(value: unknown): boolean {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * 安全:只透传 lark-cli / npx 子进程运行所必需的环境变量。
+ * 绝不把 OPENAI_API_KEY / ANTHROPIC_API_KEY / GITHUB_TOKEN 等密钥泄露给
+ * 第三方 CLI 子进程(最小权限原则)。lark-cli 通过自身配置目录鉴权,不需要这些密钥。
+ */
+function buildChildEnv(): NodeJS.ProcessEnv {
+  const allowExact = new Set([
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE',
+    'TERM', 'TMPDIR', 'TEMP', 'TMP', 'TZ', 'PWD', 'COLUMNS', 'LINES',
+    'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+    'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+  ]);
+  // 安全:刻意不透传 NPM_*(如 NPM_CONFIG_REGISTRY / NPM_TOKEN / NPM_CONFIG_*)。
+  // npx 兜底执行第三方 CLI 时,这些变量可被用于劫持 registry(供应链投毒/RCE)
+  // 或把 npm 凭据泄露给子进程。npx 仍可读 .npmrc 完成正常安装,无需环境变量。
+  const allowPrefix = ['LC_', 'LARK', 'FEISHU', 'NODE_', 'NVM_'];
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (allowExact.has(k) || allowPrefix.some((p) => k.startsWith(p))) {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 /**
@@ -121,7 +163,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
         '- ROUTING: When the user wants to create a project with a local directory AND a Feishu group chat bound together (e.g. "拉个群 + 项目路径", "create a project group"), use the `create_project_and_group_chat` tool instead — it handles directory creation, group creation, user invitation, and workspace binding in one call. Note: this tool is only available when the Feishu bot is running (/feishu start). If the tool is not listed, fall back to `im +chat-create` for a standalone group chat.',
         '- Authorization is fully automatic: if the CLI is not configured/authorized yet, this tool launches the browser device-flow login itself and streams the verification URL to the user in real time within the same call. Do NOT manually run "lark-cli config init" or "auth login" in a shell.',
         '- Do NOT guess subcommands or flags. If unsure what a command supports, run it with "--help" first (e.g. command="calendar --help"). Error responses include hints with available options — follow them instead of guessing.',
-        '- lark-cli has built-in AI agent skills with domain-specific knowledge. Use `skills list` to see all 27 skills, and `skills read <skill-name>` (e.g. command="skills" args=["read","lark-doc"]) to get version-matched API guides before using an unfamiliar domain.',,
         '',
         'COMMON COMMAND CHEATSHEET (use these patterns to avoid trial-and-error):',
         '',
@@ -141,7 +182,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
         '- Create doc from short inline text: command="docs +create" args=["--api-version", "v2", "--title", "Title", "--content", "<short-text>", "--doc-format", "markdown"]',
         '- Fetch doc content: command="docs +fetch" args=["--api-version", "v2", "--doc", "<doc_url_or_token>"]',
         '  NOTE: The flag is --doc (NOT --document-id). Accepts document URL or plain token.',
-        '  FALLBACK FOR OLD DOC: If docs +fetch returns error code 3380002 "Unsupported document type \'doc\'", the document is an old-style doc (not docx). Fallback to the low-level api command: command="api" args=["GET", "/open-apis/doc/v2/<doc_token>/raw_content"]. This requires the docs:doc:readonly scope (NOT doc:doc:readonly — docs is the domain, doc is the sub-permission). If api fails with scope 99991672, ask the user to open the page directly.',
         '- Update doc content: command="docs +update" args=["--api-version", "v2", "--doc", "<doc_url_or_token>", "--command", "overwrite", "--content", "@<relative-path>"]',
         '  CRITICAL: v2 API requires --command (overwrite|append) and --content (NOT --markdown --mode). Use --content with @file for long content. The @ prefix reads a local file (must be relative path like temp/myfile.md).',
         '- Search docs: command="docs +search" args=["--query", "<keyword>"]',
@@ -196,11 +236,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
         '- List nodes in space: command="wiki +node-list" args=["--space-id", "<id>"]',
         '- Create wiki node: command="wiki +node-create" args=["--space-id", "<id>", "--title", "New Page"]',
         '- Get node info: command="wiki +node-get" args=["--node-token", "<token>"]',
-        '  NOTE: Returns node metadata including obj_type and obj_token. To read the actual content, use docs +fetch with the obj_token from the node-get result.',
-        '  READING WIKI CONTENT (full workflow):',
-        '    1. Get node info: command="wiki +node-get" args=["--node-token", "<wiki_token>"]',
-        '    2. Read doc content: command="docs +fetch" args=["--api-version", "v2", "--doc", "<obj_token_from_step1>", "--doc-format", "markdown"]',
-        '    3. If step 2 fails with error 3380002 (old doc type), fallback: command="api" args=["GET", "/open-apis/doc/v2/<obj_token>/raw_content"]. Requires docs:doc:readonly scope (NOT doc:doc:readonly). If api fails with scope 99991672, the app lacks this scope — ask the user to open the wiki page in a browser or copy the content manually.',
         '',
         '## VC (Video Conference)',
         '- Search meetings: command="vc +search" args=["--start", "2025-01-01", "--end", "2025-01-07"]',
@@ -225,39 +260,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
         '',
         '## Approval',
         '- Use API-style: command="approval" (then run --help for subcommands)',
-        '',
-        '## Markdown (Drive-native Markdown files)',
-        '- Create Markdown file: command="markdown +create" args=["--file", "<relative-path>", "--title", "My Doc"]',
-        '- Fetch Markdown file: command="markdown +fetch" args=["--file-token", "<token>"]',
-        '- Overwrite Markdown file: command="markdown +overwrite" args=["--file-token", "<token>", "--file", "<relative-path>"]',
-        '- Diff Markdown versions or against local file: command="markdown +diff" args=["--file-token", "<token>"]',
-        '- Patch Markdown file (fetch-edit-overwrite): command="markdown +patch" args=["--file-token", "<token>", "--file", "<relative-path>"]',
-        '',
-        '## Base (Bitable / Multidimensional Table)',
-        '- Create base: command="base +base-create" args=["--name", "My Base"]',
-        '- List tables: command="base +table-list" args=["--base-token", "<token>"]',
-        '- List records: command="base +record-list" args=["--base-token", "<token>", "--table-id", "<id>"]',
-        '- Create record: command="base +record-batch-create" args=["--base-token", "<token>", "--table-id", "<id>", "--records", "[{\\"fields\\":{\\"Name\\":\\"value\\"}}]"]',
-        '- Search records: command="base +record-search" args=["--base-token", "<token>", "--table-id", "<id>", "--query", "keyword"]',
-        '- Delete record: command="base +record-delete" args=["--base-token", "<token>", "--table-id", "<id>", "--record-ids", "id1,id2"]',
-        '  NOTE: Base has 60+ subcommands for tables, fields, records, views, dashboards, workflows, forms, and roles. Always run command="base --help" first or use command="skills" args=["read","lark-base"] to get the full domain guide.',
-        '',
-        '## Skills (Built-in Agent Skills)',
-        '- List all skills: command="skills list"',
-        '- Read a skill guide: command="skills" args=["read", "<skill-name>"]',
-        '  NOTE: lark-cli ships with 27 built-in skills (lark-doc, lark-base, lark-sheets, lark-im, lark-calendar, lark-drive, lark-mail, lark-wiki, lark-markdown, lark-task, lark-vc, lark-minutes, lark-note, lark-whiteboard, lark-okr, lark-contact, lark-slides, lark-approval, lark-apps, lark-event, lark-attendance, etc.). These skills contain version-matched API guides that are more up-to-date than this cheat sheet. Use skills read before working with an unfamiliar domain.',
-        '',
-        '## Note (Meeting Notes)',
-        '- Get note detail: command="note +detail" args=["--note-id", "<id>"]',
-        '- Fetch transcript: command="note +transcript" args=["--note-id", "<id>", "--file", "transcript.txt"]',
-        '',
-        '## Whiteboard',
-        '- Query whiteboard: command="whiteboard +query" args=["--file-token", "<token>"]',
-        '- Update whiteboard: command="whiteboard +update" args=["--file-token", "<token>", "--mermaid", "graph TD; A-->B"]',
-        '',
-        '## Doctor (Health Check)',
-        '- Full health check: command="doctor"',
-        '- Offline check only: command="doctor" args=["--offline"]',
         '',
         'HELP: Run command="<domain> --help" (e.g. "docs --help", "im --help") for full flag details of any domain.',
       ].join('\n'),
@@ -308,6 +310,13 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
       return 'Parameter "command" must be a non-empty string.';
     }
 
+    // 安全:command 会直接拼进 shell:true 的命令串。lark-cli 合法 command 形如
+    // "calendar +agenda" / "docs +create" / "config init",只含字母数字与空格及 _ + - . / : =。
+    // 拦截一切 shell 元字符(; | & $ ` ( ) < > 等),防命令注入(LLM 工具调用 → RCE)。
+    if (!/^[A-Za-z0-9 _+./:=-]+$/.test(params.command)) {
+      return 'Parameter "command" contains disallowed characters; only letters, digits, spaces and _ + - . / : = are allowed (shell metacharacters are blocked for security).';
+    }
+
     if (params.args !== undefined) {
       if (!Array.isArray(params.args)) {
         return 'Parameter "args" must be an array of strings.';
@@ -345,6 +354,7 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
       const probe = spawnSync('lark-cli', ['--version'], {
         timeout: 5000,
         shell: true,
+        env: buildChildEnv(),
       });
       if (probe.status === 0) {
         return 'lark-cli';
@@ -352,15 +362,26 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
     } catch {
       // ignore and fall through to npx
     }
-    // Graceful fallback to avoid sudo/permission blocks
-    return 'npx @larksuite/cli@1.0.53';
+    // Graceful fallback to avoid sudo/permission blocks.
+    // 安全:固定版本而非 @latest,避免供应链/registry 劫持时 npx 静默拉取
+    // 被篡改的新版本(@latest 每次解析为注册表当下返回的内容)。升级 lark-cli
+    // 时显式 bump 此处版本号即可。
+    return `npx @larksuite/cli@${LARK_CLI_PINNED_VERSION}`;
   }
 
   /**
    * Escapes arguments to secure the command execution against shell command injections.
+   *
+   * 安全:这些参数最终会拼进 `spawn(cmdString, { shell: true })` 的命令串,交给
+   * /bin/sh 执行。先剥掉换行/回车(\r\n),再用双引号包裹并转义 " $ ` \,做到:
+   *   1. 换行/回车被中和,绝不可能断出新的 shell 命令(防换行注入,纵深防御);
+   *   2. 双引号转义防止提前闭合引号、反引号/$ 转义防止命令替换与变量展开。
+   * lark-cli 的长内容一律走 @file(见 cheatsheet),内联参数本就不应含裸换行,
+   * 因此剥离换行不会破坏正常用法。
    */
   private sanitizeArg(arg: string): string {
-    return `"${arg.replace(/(["$`\\])/g, '\\$1')}"`;
+    const withoutNewlines = arg.replace(/[\r\n]+/g, ' ');
+    return `"${withoutNewlines.replace(/(["$`\\])/g, '\\$1')}"`;
   }
 
   /**
@@ -437,21 +458,31 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
           }
         }
 
-        // Scope exclusion: always exclude the high-risk send_as_user scope
-        // (company-policy-prohibited for many orgs) plus any project-level
-        // excludes from .easycode/settings.json → feishu.excludeScopes.
-        // The --exclude flag filters scopes out of the request list; excluding
-        // a scope that isn't applicable to the target domain is a no-op.
-        const DEFAULT_EXCLUDE_SCOPES = ['im:message.send_as_user'];
+        // 默认不强制排除任何 scope。早期版本默认排除 "im:message.send_as_user",
+        // 但按域登录(task / calendar 等)的请求 scope 集里根本没有这个 scope,
+        // lark-cli 会因 "--exclude 的 scope 不在请求集中" 直接报错,导致这些域
+        // 一律登录失败(例如今日任务一条都查不到)。需要收紧权限的企业可通过
+        // settings.json 的 feishu.excludeScopes 显式配置。
+        const defaultExcludes: string[] = [];
         const configuredExcludes = feishuSettings?.excludeScopes || [];
-        const uniqueExcludes = [...new Set([...DEFAULT_EXCLUDE_SCOPES, ...configuredExcludes])];
+        const uniqueExcludes = Array.from(new Set([...defaultExcludes, ...configuredExcludes]));
 
         if (feishuSettings?.recommend && !authCmd.includes('--recommend')) {
           authCmd += ' --recommend';
         }
 
         if (uniqueExcludes.length > 0 && !authCmd.includes('--exclude')) {
-          authCmd += ` --exclude "${uniqueExcludes.join(',')}"`;
+          // 安全:excludeScopes 来自用户可写的 settings.json,过滤为合法 scope 格式后再转义,
+          // 防止经 shell:true 注入命令。
+          // 合法 Lark scope 可含多段冒号与数字(如 mail:user_mailbox.message.body:read、
+          // docx:document:readonly、im:message.receive_v1)。只放行字母/数字/下划线/点/冒号——
+          // 均非 shell 元字符,杜绝经 shell:true 注入;随后还会经 sanitizeArg 加引号转义。
+          const safeExcludes = uniqueExcludes.filter((s) =>
+            /^[a-z0-9_]+:[a-z0-9_.:]+$/i.test(s),
+          );
+          if (safeExcludes.length > 0) {
+            authCmd += ` --exclude ${this.sanitizeArg(safeExcludes.join(','))}`;
+          }
         }
 
         if (updateOutput) {
@@ -506,13 +537,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
       return false;
     }
 
-    // If the app hasn't applied for the required scopes, automatic auth
-    // takeover will never succeed (re-auth doesn't grant new scopes to the
-    // app — the admin must add them in the developer console).
-    if (haystack.includes('app_scope_not_applied')) {
-      return false;
-    }
-
     return (
       haystack.includes('not configured') ||
       haystack.includes('"type": "config"') ||
@@ -558,7 +582,9 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
     originalCommand: string,
     binary: string,
   ): string {
-    const haystack = `${raw.stdout}\n${raw.stderr}`;
+    // 安全:lark-cli 输出受供应链/MITM 影响,可能被恶意撑到超大体积。在用于正则
+    // 匹配前先截断到 8KB 上限,作为 ReDoS 的兜底防线(配合下面的线性正则)。
+    const haystack = `${raw.stdout}\n${raw.stderr}`.slice(0, 8 * 1024);
 
     // 1. Look for an explicit "lark-cli auth login --domain/--scope" in the hint.
     //    lark-cli wraps the command in backticks for display, so we must
@@ -576,14 +602,20 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
     //    escaping, or fail because the open platform rejects specific scope granularities.
     //    Instead, we dynamically map any extracted "--scope" list into a safe,
     //    quote-free, comma-separated "--domain" list (e.g. "--domain mail").
+    //
+    //    安全:旧式 --scope 分支用过 `[^\s`]+(?:\s+[^\s`]+)*` 的嵌套量词,在对抗性
+    //    输入下会发生灾难性回溯(ReDoS)。改用单一字符类 `[^`\n]+` 一次性吃到换行
+    //    或闭合反引号,语义不变(同样在闭合反引号/行尾停下,可含空格),但回溯线性。
     const authCmdMatch = haystack.match(
-      /lark-cli\s+auth\s+login\s+(--domain\s+[^\s`]+|--scope\s+(?:"[^"]*"|[^\s`]+(?:\s+[^\s`]+)*))/,
+      /lark-cli\s+auth\s+login\s+(--domain\s+[^\s`]+|--scope\s+(?:"[^"]*"|[^`\n]+))/,
     );
     if (authCmdMatch) {
       const matchStr = authCmdMatch[1]; // e.g., --domain calendar or --scope "mail:..."
       if (matchStr.startsWith('--scope')) {
-        // Extract raw scope string inside quotes or unquoted
-        const scopeContentMatch = matchStr.match(/--scope\s+"([^"]*)"/) || matchStr.match(/--scope\s+([^\s`]+(?:\s+[^\s`]+)*)/);
+        // Extract raw scope string inside quotes or unquoted.
+        // 安全:非引号分支同样改用单一字符类 `[^`\n]+`(线性,无嵌套量词),
+        // 避免 ReDoS;语义不变,仍可含空格、停在反引号/行尾。
+        const scopeContentMatch = matchStr.match(/--scope\s+"([^"]*)"/) || matchStr.match(/--scope\s+([^`\n]+)/);
         if (scopeContentMatch) {
           // Strip literal backslashes and quotes (e.g. from escaped \" in JSON errors)
           const rawScopes = scopeContentMatch[1].replace(/[\\'"]+/g, '');
@@ -595,16 +627,25 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
               scopes.map((s) => s.split(':')[0]).filter((d) => d && d.length > 0)
             )
           );
-          if (domains.length > 0) {
+          // 安全:domain 来自 lark-cli 输出(供应链/MITM 可控),仅接受安全字符防注入。
+          const safeDomains = domains.filter((d) => /^[a-z_]+$/i.test(d));
+          if (safeDomains.length > 0) {
             // Map the scopes to robust, quote-free --domain parameters!
-            return `${binary} auth login --domain ${domains.join(',')}`;
+            return `${binary} auth login --domain ${safeDomains.join(',')}`;
           }
         }
       }
 
-      // If it is --domain, strip the "lark-cli" prefix and re-attach our binary.
-      const flags = authCmdMatch[0].replace(/^lark-cli\s+auth\s+login\s+/, '');
-      return `${binary} auth login ${flags}`;
+      // If it is --domain, extract & whitelist the domain value. Never re-attach the
+      // raw matched text — it could carry shell metacharacters from upstream output.
+      const domainOnly = matchStr.match(/--domain\s+([^\s`]+)/);
+      if (domainOnly) {
+        const safe = domainOnly[1].split(',').filter((d) => /^[a-z_]+$/i.test(d));
+        if (safe.length > 0) {
+          return `${binary} auth login --domain ${safe.join(',')}`;
+        }
+      }
+      return `${binary} auth login`;
     }
 
     // 2. Look for "current command requires scope(s): X, Y"
@@ -615,16 +656,20 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
       // Use the first scope listed; strip trailing punctuation/backticks.
       const scope = scopeMatch[1].split(',')[0].trim().replace(/[`'"]+$/, '');
       const domain = scope.split(':')[0];
-      if (domain) {
+      // 安全:scope/domain 来自 lark-cli 输出,白名单校验后再拼,杜绝命令注入。
+      if (/^[a-z_]+$/i.test(domain)) {
         return `${binary} auth login --domain ${domain}`;
       }
-      return `${binary} auth login --scope ${scope}`;
+      if (/^[a-z_]+:[a-z_.]+$/i.test(scope)) {
+        return `${binary} auth login --scope ${scope}`;
+      }
+      return `${binary} auth login`;
     }
 
     // 3. Fallback: infer domain from the command's first segment.
     //    e.g. "calendar +agenda" → domain="calendar"
     const domain = originalCommand.trim().split(/\s+/)[0];
-    if (domain) {
+    if (/^[a-z_]+$/i.test(domain)) {
       return `${binary} auth login --domain ${domain}`;
     }
 
@@ -648,7 +693,7 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
       const child = spawn(cmdString, {
         shell: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: buildChildEnv(),
       });
 
       let stdout = '';
@@ -813,9 +858,17 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
     // Successful exit. If an auth URL was seen and exit code is 0, the
     // device-flow authorization completed successfully.
     if (code === 0) {
+      // 安全:output 来自 lark-cli(供应链/MITM/prompt-injection 可控)。盲目
+      // JSON.parse 后直接塞进 data/llmContent 交给模型,等于把任意结构(甚至
+      // 顶层标量、被精心构造的字段)当成可信结构化结果。这里做基本类型/结构校验:
+      // 仅接受「纯对象」或「数组」作为结构化 data;其余(标量、null、解析失败)
+      // 一律当作不可信纯文本 {rawOutput},不信任其内部内容。
       let parsedData: any;
       try {
-        parsedData = JSON.parse(output || '{}');
+        const candidate = JSON.parse(output || '{}');
+        parsedData = isPlainStructuredData(candidate)
+          ? candidate
+          : { rawOutput: output };
       } catch {
         parsedData = { rawOutput: output };
       }
@@ -867,35 +920,6 @@ export class LarkCliTool extends BaseTool<LarkCliParams, LarkCliResult> {
 
     if (errMessage.toLowerCase().includes('pending approval')) {
       enrichedHint += `\n\n🔒 CRITICAL INFO FOR USER & AI:\nThe Feishu/Lark application is currently pending approval by your corporate enterprise administrator.\n👉 Action required: Please contact your IT/Feishu administrator to approve this custom app in the Feishu Admin Console (飞书管理后台 - 版本管理与发布) first, then run this command again. Do NOT try other authentication or login commands because they will also be blocked until approved.`;
-    }
-
-    if (
-      errMessage.includes('3380002') ||
-      errMessage.includes('Unsupported document type')
-    ) {
-      enrichedHint += `\n\n💡 This is an old-style 'doc' document (not docx). Fallback: command="api" args=["GET", "/open-apis/doc/v2/<doc_token>/raw_content"]. Requires docs:doc:readonly scope (NOT doc:doc:readonly). If api also fails with 99991672, ask the user to open the wiki page directly.`;
-    }
-
-    if (errMessage.includes('99991672') || errMessage.includes('app_scope_not_applied')) {
-      // Extract missing scopes and console URL from lark-cli's JSON error
-      try {
-        const parsed = JSON.parse(errMessage);
-        const err = parsed?.error;
-        if (err) {
-          const missingScopes = err.missing_scopes || [];
-          const consoleUrl = err.console_url || '';
-          if (missingScopes.length > 0) {
-            enrichedHint += `\n\n🔐 当前应用缺少以下权限范围 (scope): ${missingScopes.join(', ')}`;
-          }
-          if (consoleUrl) {
-            enrichedHint += `\n👉 请在飞书开发者后台申请权限后重新授权: ${consoleUrl}`;
-          } else if (missingScopes.length > 0) {
-            enrichedHint += `\n👉 请在飞书开发者后台 (https://open.feishu.cn/app/cli_aa9c19096a7c9cc5/auth) 申请权限后重新授权`;
-          }
-        }
-      } catch {
-        enrichedHint += `\n\n💡 缺少 API 权限。请在飞书开发者后台 (https://open.feishu.cn/app/cli_aa9c19096a7c9cc5/auth) 申请所需权限后重新授权。`;
-      }
     }
 
     try {

@@ -1,7 +1,6 @@
 /**
  * @license
- * Copyright 2026 Easy Code team
- * https://github.com/OrionStarAI/DeepVCode
+ * Copyright 2026 Felix
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -17,8 +16,8 @@ import { Config } from '../config/config.js';
  * 新品牌 npm 包名与全局命令名。
  * 自更新固定从 npm 拉取 latest，并以飞书常驻模式重新拉起。
  */
-export const SELF_UPDATE_PACKAGE = 'easycode-ai';
-export const SELF_UPDATE_RELAUNCH_COMMAND = 'easycode';
+export const SELF_UPDATE_PACKAGE = 'otto-ai';
+export const SELF_UPDATE_RELAUNCH_COMMAND = 'otto';
 export const SELF_UPDATE_RELAUNCH_ARGS = ['--feishu'];
 
 /**
@@ -86,7 +85,7 @@ export function buildRelaunchScript(opts: BuildRelaunchScriptOptions): string {
   }
 
   return `'use strict';
-// Easy Code relaunch helper (auto-generated, cross-platform)
+// Otto relaunch helper (auto-generated, cross-platform)
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 
@@ -167,8 +166,13 @@ async function main() {
   // 4) 拉起新进程
   //    Windows: cmd.exe /c <command>（有 conpty，用户可见 TUI）
   //    Linux/macOS: login shell -l -c <command>（加载 .bashrc/.profile，
-  //      使 nvm/homebrew 等 PATH 生效，确保 easycode 命令可找到）
-  const env = Object.assign({}, process.env, { EASYCODE_STARTUP_DELAY_MS: '2000' });
+  //      使 nvm/homebrew 等 PATH 生效，确保 otto 命令可找到）
+  // 同时设置新旧两个环境变量名：新进程优先读 OTTO_STARTUP_DELAY_MS，
+  // 旧版本二进制（升级过渡期）仍能读到 OTTO_STARTUP_DELAY_MS，向后兼容。
+  const env = Object.assign({}, process.env, {
+    OTTO_STARTUP_DELAY_MS: '2000',
+    OTTO_STARTUP_DELAY_MS: '2000',
+  });
   let child;
 
   if (process.platform === 'win32') {
@@ -217,9 +221,9 @@ main();
  * 安排当前进程退出（外挂会轮询父 PID 消失后接管）。
  *
  * 重启方式（双轨）：
- *   - Windows: cmd.exe /c easycode --feishu（有 conpty，用户能看到界面）
- *   - Linux/macOS: login shell -l -c easycode --feishu（加载 .bashrc/.profile，
- *     使 nvm/homebrew 等 PATH 生效，确保 easycode 命令可找到）
+ *   - Windows: cmd.exe /c otto --feishu（有 conpty，用户能看到界面）
+ *   - Linux/macOS: login shell -l -c otto --feishu（加载 .bashrc/.profile，
+ *     使 nvm/homebrew 等 PATH 生效，确保 otto 命令可找到）
  *
  * @returns 写出的脚本路径
  */
@@ -227,13 +231,13 @@ export function launchRelaunchHelper(install: RelaunchInstallMode): string {
   const parentPid = process.pid;
   const scriptPath = join(
     tmpdir(),
-    `easycode-relaunch-${parentPid}-${Date.now()}.js`,
+    `otto-relaunch-${parentPid}-${Date.now()}.js`,
   );
 
   // 重启日志固定写到全局配置目录，便于排障。
   let logPath: string | undefined;
   try {
-    const logDir = join(homedir(), '.easycode-user');
+    const logDir = join(homedir(), '.otto-user');
     mkdirSync(logDir, { recursive: true });
     logPath = join(logDir, 'cli-debug.log');
   } catch {
@@ -310,7 +314,7 @@ export interface SelfUpdateParams {
  * SelfUpdateTool — 仅在飞书常驻模式下动态注册。
  *
  * 用法：
- *   - 默认：从 npm 安装 easycode-ai@latest 并重启
+ *   - 默认：从 npm 安装 otto-ai@latest 并重启
  *   - action='restart_only'：不安装，仅重启当前进程（救卡死 / 应用新配置）
  *   - source='local' + sourcePath=<abs .tgz>：安装某个本地 tgz 包并重启
  */
@@ -328,17 +332,17 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
     super(
       SelfUpdateTool.Name,
       'SelfUpdate',
-      'Updates and/or restarts Easy Code (Feishu/Lark gateway mode only). Use ONLY when the user ' +
-        'explicitly asks to update/upgrade or restart Easy Code.\n' +
+      'Updates and/or restarts Otto (Feishu/Lark gateway mode only). Use ONLY when the user ' +
+        'explicitly asks to update/upgrade or restart Otto.\n' +
         'Parameters:\n' +
         '- action: "update_and_restart" (default) installs a new version then restarts; ' +
         '"restart_only" just restarts the current process WITHOUT installing (use to recover a stuck ' +
         'session or apply changed config).\n' +
-        '- source: "npm" (default) installs easycode-ai@latest from npm; "local" installs a local .tgz ' +
+        '- source: "npm" (default) installs otto-ai@latest from npm; "local" installs a local .tgz ' +
         '(requires sourcePath).\n' +
         '- sourcePath: absolute path to a local .tgz, required when source="local".\n' +
         'A detached cross-platform helper performs the work after this process exits, then relaunches ' +
-        '`easycode --feishu` automatically. The bot is briefly offline (tens of seconds) and returns by ' +
+        '`otto --feishu` automatically. The bot is briefly offline (tens of seconds) and returns by ' +
         'itself; Feishu credentials are stored globally so no re-login is needed. If unsure which mode the ' +
         'user wants, ASK them first.',
       Icon.Hammer,
@@ -355,7 +359,7 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
             type: Type.STRING,
             enum: ['npm', 'local'],
             description:
-              'npm (default) = install easycode-ai@latest; local = install a local .tgz (needs sourcePath). Ignored when action=restart_only.',
+              'npm (default) = install otto-ai@latest; local = install a local .tgz (needs sourcePath). Ignored when action=restart_only.',
           },
           sourcePath: {
             type: Type.STRING,
@@ -398,11 +402,11 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
   }
 
   getDescription(params: SelfUpdateParams): string {
-    if (params.action === 'restart_only') return 'Restart Easy Code (Feishu mode)';
+    if (params.action === 'restart_only') return 'Restart Otto (Feishu mode)';
     if (params.source === 'local') {
       return `Install local package and restart: ${params.sourcePath ?? '(missing path)'}`;
     }
-    return 'Update Easy Code to latest and restart (Feishu mode)';
+    return 'Update Otto to latest and restart (Feishu mode)';
   }
 
   /** 把参数解析为底层安装模式。 */
@@ -420,22 +424,6 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
     params: SelfUpdateParams,
     _signal: AbortSignal,
   ): Promise<ToolResult> {
-    // 桌面版托管场景：网关进程由 Electron 桌面端 spawn（带 EASYCODE_DESKTOP_MANAGED
-    // 标记）。self_update 的「npm 安装 + 外挂脚本重启 easycode --feishu」流程在这里
-    // 不适用——它会拉起一个脱离桌面端管理的 CLI 独立网关。桌面版的更新/重启应由应用
-    // 自身负责。直接短路返回不支持，并明确告知 AI 不要重试。
-    if (process.env.EASYCODE_DESKTOP_MANAGED === '1') {
-      return {
-        llmContent:
-          'self_update is NOT supported in the Easy Code Desktop app. The desktop app manages ' +
-          'its own gateway lifecycle (update & restart) through its UI, not via npm self-update. ' +
-          'Do NOT retry this tool. Tell the user that updating/restarting is handled by the ' +
-          'desktop app itself.',
-        returnDisplay: '⚠️ 当前是桌面版，不支持此功能（更新与重启由桌面应用自身处理）。',
-        summary: 'self_update disabled on Desktop',
-      };
-    }
-
     const validationError = this.validateToolParams(params);
     if (validationError) {
       return {
@@ -479,7 +467,7 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
 
     const nonWinHint =
       process.platform !== 'win32'
-        ? '根据您的操作系统限制，重启后将以后台进程（无界面）运行，使用 `ps -ef | grep easycode` 即可查看。'
+        ? '根据您的操作系统限制，重启后将以后台进程（无界面）运行，使用 `ps -ef | grep otto` 即可查看。'
         : '';
     const displayText =
       install.type === 'none'
@@ -491,7 +479,7 @@ export class SelfUpdateTool extends BaseTool<SelfUpdateParams, ToolResult> {
     return {
       llmContent:
         `Self-update started: will ${actionText} via a detached helper after this process exits, ` +
-        'then relaunch `easycode --feishu`. The bot will be briefly offline and return automatically. ' +
+        'then relaunch `otto --feishu`. The bot will be briefly offline and return automatically. ' +
         'Tell the user it is in progress and will be back shortly.',
       returnDisplay: displayText,
       summary: 'Self-update / restart triggered',

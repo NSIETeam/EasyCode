@@ -48,26 +48,32 @@ Do NOT use this tool:
 - \`fact\` (string, required): The specific fact or piece of information to remember. This should be a clear, self-contained statement. For example, if the user says "My favorite color is blue", the fact would be "My favorite color is blue".
 `;
 
-export const GEMINI_CONFIG_DIR = '.easycode-user';
-export const DEFAULT_CONTEXT_FILENAME = 'DEEPV.md';
-export const MEMORY_SECTION_HEADER = '## DeepV Code Added Memories';
+export const OTTO_CONFIG_DIR = '.otto-user';
+export const DEFAULT_CONTEXT_FILENAME = 'OTTO.md';
+export const MEMORY_SECTION_HEADER = '## Otto Added Memories';
 
 /**
- * Default context file names in priority order.
- * The first existing file will be used.
+ * 单个记忆文件的写入上限(字节)。超过则不再追加新事实并 warn,
+ * 防止 append-only 记忆无限膨胀拖垮每次 prompt 的 token 成本与资源。
+ */
+export const MAX_MEMORY_FILE_SIZE = 256 * 1024; // 256KB
+
+/**
+ * Otto 只认自己的上下文文件 OTTO.md。
+ * 早期版本还认 AGENTS.md / .cursor / .augement——但 AGENTS.md 是 clawd、codex
+ * 等其它工具的通用约定文件,会被向上/全局扫描当成"Otto 的记忆"加载进来,
+ * 造成跨工具串味(读到 ~/clawd 、~/.codex 下别人的记忆)。这里收紧为单一来源。
+ * 需要兼容 AGENTS.md 的项目可通过 settings 的 contextFileName 显式配置。
  */
 export const DEFAULT_CONTEXT_FILENAMES = [
-  'AGENTS.md',
-  'DEEPV.md',
-  '.augement/*.md',
-  '.cursor/rules/*.mdc'
+  'OTTO.md',
 ];
 
 // This variable will hold the currently configured filename for context files.
-// It defaults to DEFAULT_CONTEXT_FILENAME but can be overridden by setGeminiMdFilename.
+// It defaults to DEFAULT_CONTEXT_FILENAME but can be overridden by setOttoMdFilename.
 let currentGeminiMdFilename: string | string[] = DEFAULT_CONTEXT_FILENAME;
 
-export function setGeminiMdFilename(newFilename: string | string[]): void {
+export function setOttoMdFilename(newFilename: string | string[]): void {
   if (Array.isArray(newFilename)) {
     if (newFilename.length > 0) {
       currentGeminiMdFilename = newFilename.map((name) => name.trim());
@@ -96,7 +102,7 @@ export function getAllGeminiMdFilenames(): string[] {
  * This is used when the filename is not explicitly set and we want to find
  * the highest priority existing configuration file.
  */
-export async function discoverContextFilenames(baseDir: string = path.join(homedir(), GEMINI_CONFIG_DIR)): Promise<string[]> {
+export async function discoverContextFilenames(baseDir: string = path.join(homedir(), OTTO_CONFIG_DIR)): Promise<string[]> {
   const foundFiles = await findContextFilesInDirectory(baseDir, DEFAULT_CONTEXT_FILENAMES);
 
   if (foundFiles.length > 0) {
@@ -252,8 +258,33 @@ async function discoverProjectContextFilenames(projectDir: string = process.cwd(
 }
 
 async function getProjectMemoryFilePath(config: Config): Promise<string> {
-  // Always use project root directory DEEPV.md for memory storage
-  return path.join(config.getProjectRoot(), 'DEEPV.md');
+  // Always use project root directory OTTO.md for memory storage
+  return path.join(config.getProjectRoot(), 'OTTO.md');
+}
+
+/** 记忆根目录(~/.otto-user/memory),三层记忆(global/session)共用根。 */
+export const MEMORY_ROOT_DIR = path.join(homedir(), OTTO_CONFIG_DIR, 'memory');
+
+/** 飞书按会话隔离的个人记忆目录(每个 chat 一个文件,避免跨会话/跨用户串味)。 */
+export const FEISHU_SESSION_MEMORY_DIR = path.join(MEMORY_ROOT_DIR, 'sessions');
+
+/**
+ * 全局(跨项目、跨会话)记忆文件:~/.otto-user/memory/global.md。
+ * 用于沉淀用户级偏好/习惯,与项目级 OTTO.md、会话级 sessions/<id>.md 三层并存。
+ */
+export const GLOBAL_MEMORY_FILE = path.join(MEMORY_ROOT_DIR, 'global.md');
+
+/** 全局记忆文件的绝对路径(供分层记忆 Provider 使用)。 */
+export function getGlobalMemoryPath(): string {
+  return GLOBAL_MEMORY_FILE;
+}
+
+/** 按飞书 chatId 解析其专属记忆文件路径(文件名净化,防路径穿越)。 */
+export function getFeishuSessionMemoryPath(chatId: string): string {
+  const safe = (chatId || 'unknown')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 120);
+  return path.join(FEISHU_SESSION_MEMORY_DIR, `${safe}.md`);
 }
 
 /**
@@ -301,6 +332,49 @@ export class MemoryTool extends BaseTool<SaveMemoryParams, ToolResult> {
     processedText = processedText.replace(/^(-+\s*)+/, '').trim();
     const newMemoryItem = `- ${processedText}`;
 
+    // 正确性:按文件串行化 read-modify-write,防止并发(最多 6 个 Sub-Agent +
+    // 异步飞书消息分发)同时写同一记忆文件 → "后写覆盖先写、事实丢失"。
+    const prev =
+      MemoryTool.memoryWriteChains.get(memoryFilePath) ?? Promise.resolve();
+    const run = prev
+      .catch(() => undefined)
+      .then(() =>
+        MemoryTool.writeMemoryEntryLocked(
+          memoryFilePath,
+          newMemoryItem,
+          fsAdapter,
+        ),
+      );
+    MemoryTool.memoryWriteChains.set(memoryFilePath, run);
+    try {
+      await run;
+    } finally {
+      if (MemoryTool.memoryWriteChains.get(memoryFilePath) === run) {
+        MemoryTool.memoryWriteChains.delete(memoryFilePath);
+      }
+    }
+  }
+
+  /** 按文件串行化的记忆写入链(进程内 mutex,消除并发丢更新)。 */
+  private static memoryWriteChains = new Map<string, Promise<void>>();
+
+  /** 记忆写入临界区:read-modify-write,由 memoryWriteChains 保证同文件串行。 */
+  private static async writeMemoryEntryLocked(
+    memoryFilePath: string,
+    newMemoryItem: string,
+    fsAdapter: {
+      readFile: (path: string, encoding: 'utf-8') => Promise<string>;
+      writeFile: (
+        path: string,
+        data: string,
+        encoding: 'utf-8',
+      ) => Promise<void>;
+      mkdir: (
+        path: string,
+        options: { recursive: boolean },
+      ) => Promise<string | undefined>;
+    },
+  ): Promise<void> {
     try {
       await fsAdapter.mkdir(path.dirname(memoryFilePath), { recursive: true });
       let content = '';
@@ -308,6 +382,21 @@ export class MemoryTool extends BaseTool<SaveMemoryParams, ToolResult> {
         content = await fsAdapter.readFile(memoryFilePath, 'utf-8');
       } catch (_e) {
         // File doesn't exist, will be created with header and item.
+      }
+
+      // 去重:同一条事实(去掉 "- " 前缀后的纯文本)已存在则跳过,
+      // 避免重复事实灌满记忆文件。在临界区内做,保证读到的是最新内容。
+      const factText = newMemoryItem.replace(/^-\s*/, '').trim();
+      if (factText.length > 0 && content.includes(factText)) {
+        return; // 已记录过该事实,幂等跳过
+      }
+
+      // 大小上限:超过 MAX_MEMORY_FILE_SIZE 则不再追加,防止记忆无限膨胀。
+      if (Buffer.byteLength(content, 'utf-8') >= MAX_MEMORY_FILE_SIZE) {
+        console.warn(
+          `[MemoryTool] Memory file ${memoryFilePath} has reached the size limit (${MAX_MEMORY_FILE_SIZE} bytes); skipping new memory entry.`,
+        );
+        return;
       }
 
       const headerIndex = content.indexOf(MEMORY_SECTION_HEADER);
@@ -366,7 +455,11 @@ export class MemoryTool extends BaseTool<SaveMemoryParams, ToolResult> {
 
     try {
       // Use the static method with actual fs promises
-      const memoryFilePath = await getProjectMemoryFilePath(this.config);
+      // 飞书会话:若 config 指定了按会话隔离的记忆文件,存到该文件(每 chat 独立);
+      // 否则沿用项目级 OTTO.md(向后兼容)。
+      const sessionFile = this.config.getFeishuSessionMemoryFile?.();
+      const memoryFilePath =
+        sessionFile || (await getProjectMemoryFilePath(this.config));
       await MemoryTool.performAddMemoryEntry(fact, memoryFilePath, {
         readFile: fs.readFile,
         writeFile: fs.writeFile,

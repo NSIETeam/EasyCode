@@ -466,9 +466,7 @@ Reserve this tool for system commands and terminal operations that have no dedic
     let description = `${params.command}`;
     // append optional [in directory]
     // note description is needed even if validation fails due to absolute path
-    // `(root)` is the sentinel meaning "project root" (the default cwd), so it
-    // carries no information — skip it rather than leak the raw token into the UI.
-    if (params.directory && params.directory !== '(root)') {
+    if (params.directory) {
       description += ` [in ${params.directory}]`;
     }
     // append optional (description), replacing any line breaks with spaces
@@ -728,6 +726,9 @@ Reserve this tool for system commands and terminal operations that have no dedic
           cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
           env: {
             ...process.env,
+            // New marker for tools that detect they run inside Otto's shell.
+            // Legacy GEMINI_CLI kept so existing user scripts keep working.
+            OTTO_CLI: '1',
             GEMINI_CLI: '1',
           },
           // On Windows, use shell: true to properly handle quotes
@@ -740,6 +741,9 @@ Reserve this tool for system commands and terminal operations that have no dedic
           cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
           env: {
             ...process.env,
+            // New marker for tools that detect they run inside Otto's shell.
+            // Legacy GEMINI_CLI kept so existing user scripts keep working.
+            OTTO_CLI: '1',
             GEMINI_CLI: '1',
           },
         });
@@ -977,7 +981,7 @@ Reserve this tool for system commands and terminal operations that have no dedic
         : `moved to the background by the user`;
 
       return {
-        llmContent: `[Easy Code - SYSTEM NOTIFICATION] Command "${params.command}" has been ${triggerReason} (Task ID: ${backgroundTaskId}).
+        llmContent: `[Otto - SYSTEM NOTIFICATION] Command "${params.command}" has been ${triggerReason} (Task ID: ${backgroundTaskId}).
 
 ⚠️ IMPORTANT RULES FOR BACKGROUND TASKS:
 1. DO NOT report this task as completed.
@@ -1098,7 +1102,7 @@ Reserve this tool for system commands and terminal operations that have no dedic
     if (summarizeConfig && summarizeConfig[this.name]) {
       const summary = await summarizeToolOutput(
         llmContent,
-        this.config.getGeminiClient(),
+        this.config.getOttoClient(),
         signal,
         summarizeConfig[this.name].tokenBudget,
       );
@@ -1185,6 +1189,9 @@ Reserve this tool for system commands and terminal operations that have no dedic
           cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
           env: {
             ...process.env,
+            // New marker for tools that detect they run inside Otto's shell.
+            // Legacy GEMINI_CLI kept so existing user scripts keep working.
+            OTTO_CLI: '1',
             GEMINI_CLI: '1',
           },
           shell: false,
@@ -1197,6 +1204,9 @@ Reserve this tool for system commands and terminal operations that have no dedic
           cwd: path.resolve(this.config.getTargetDir(), params.directory || ''),
           env: {
             ...process.env,
+            // New marker for tools that detect they run inside Otto's shell.
+            // Legacy GEMINI_CLI kept so existing user scripts keep working.
+            OTTO_CLI: '1',
             GEMINI_CLI: '1',
           },
         });
